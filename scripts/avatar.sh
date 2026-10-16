@@ -30,10 +30,28 @@ EXTRA=()
 
 cd "$SAIDA"
 INICIO=$(date +%s)
-systemd-run --user --scope -q -p MemoryMax="$TETO" -p MemorySwapMax=0 \
-  "$RAIZ/.venv/bin/torchrun" --nproc_per_node=1 "$LONGCAT_DIR/run_demo_avatar_single_audio_to_video.py" \
+# GB10 = memória unificada: o que o CUDA aloca não entra no MemoryMax do cgroup.
+# Trava real: mata a geração se o sistema ficar com menos de LONGCAT_LIVRE_MIN_MB livres.
+LIVRE_MIN="${LONGCAT_LIVRE_MIN_MB:-10240}"
+(
+  while sleep 3; do
+    PID=$(pgrep -f "run_demo_avatar_single_audio_to_video.py --context" | head -1)
+    LIVRE=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    RSS=$( [ -n "$PID" ] && awk '/VmRSS/{print int($2/1024)}' /proc/$PID/status 2>/dev/null )
+    echo "$(( $(date +%s) - INICIO )) livre_mb=$LIVRE rss_mb=${RSS:-0}" >> "$SAIDA/memoria.txt"
+    if [ "$LIVRE" -lt "$LIVRE_MIN" ]; then
+      echo "ABORTADO: memória livre ${LIVRE} MB < ${LIVRE_MIN} MB" | tee -a "$SAIDA/log.txt"
+      pkill -9 -f "run_demo_avatar_single_audio_to_video.py --context"; break
+    fi
+  done
+) &
+GUARDA=$!
+trap 'kill $GUARDA 2>/dev/null' EXIT
+MALLOC_ARENA_MAX=2 systemd-run --user --scope -q -p MemoryMax="$TETO" -p MemorySwapMax=0 \
+  "$RAIZ/.venv/bin/torchrun" --nproc_per_node=1 "$RAIZ/scripts/rodar.py" "$LONGCAT_DIR/run_demo_avatar_single_audio_to_video.py" \
     --context_parallel_size=1 --checkpoint_dir="$PESOS/LongCat-Video-Avatar-1.5" \
     --stage_1=ai2v --input_json="$SAIDA/entrada.json" --output_dir="$SAIDA" --resolution="$RES" \
     --use_distill --model_type avatar-v1.5 --use_int8 "${EXTRA[@]}" 2>&1 | tee "$SAIDA/log.txt"
 echo "tempo_total_s=$(( $(date +%s) - INICIO ))" | tee -a "$SAIDA/log.txt"
+echo "pico: $(sort -t= -k2 -n "$SAIDA/memoria.txt" | head -1)  rss_max_mb=$(grep -o 'rss_mb=[0-9]*' "$SAIDA/memoria.txt" | cut -d= -f2 | sort -n | tail -1)" | tee -a "$SAIDA/log.txt"
 ls -la "$SAIDA"/*.mp4
